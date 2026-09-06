@@ -11,6 +11,7 @@ from typing import Literal
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
@@ -26,6 +27,7 @@ from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
 from .sql import DbConnPool
+from .sql import ReadOnlySqlDriver
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
@@ -48,21 +50,30 @@ class AccessMode(str, Enum):
 
     RESTRICTED = "restricted"  # Read-only with safety features (default)
     UNRESTRICTED = "unrestricted"  # Unrestricted access
+    READONLY = "readonly"  # Read-only at DB level, no SQL validation
 
 
 # Global variables
 db_connection = DbConnPool()
 current_access_mode = AccessMode.RESTRICTED
+current_allowed_function_prefixes: tuple[str, ...] = ()
 shutdown_in_progress = False
 
 
-async def get_sql_driver() -> SqlDriver | SafeSqlDriver:
+async def get_sql_driver() -> SqlDriver | SafeSqlDriver | ReadOnlySqlDriver:
     """Get the appropriate SQL driver based on the current access mode."""
     base_driver = SqlDriver(conn=db_connection)
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+        return SafeSqlDriver(
+            sql_driver=base_driver,
+            timeout=30,
+            allowed_function_prefixes=current_allowed_function_prefixes,
+        )
+    elif current_access_mode == AccessMode.READONLY:
+        logger.debug("Using ReadOnlySqlDriver (READONLY mode)")
+        return ReadOnlySqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
@@ -540,6 +551,40 @@ async def execute_sql(
         return format_error_response(str(e))
 
 
+def configure_access_mode(access_mode: AccessMode) -> None:
+    """Set the access mode and register execute_sql with a matching description and annotations.
+
+    Any earlier execute_sql registration is replaced, so this can be called more than once
+    (the server calls it at startup; tests call it to switch modes).
+    """
+    global current_access_mode
+    current_access_mode = access_mode
+
+    try:
+        mcp.remove_tool("execute_sql")
+    except ToolError:
+        pass  # not registered yet (first call at startup)
+
+    if access_mode == AccessMode.UNRESTRICTED:
+        mcp.add_tool(
+            execute_sql,
+            description="Execute any SQL query",
+            annotations=ToolAnnotations(
+                title="Execute SQL",
+                destructiveHint=True,
+            ),
+        )
+    else:
+        mcp.add_tool(
+            execute_sql,
+            description="Execute a read-only SQL query",
+            annotations=ToolAnnotations(
+                title="Execute SQL (Read-Only)",
+                readOnlyHint=True,
+            ),
+        )
+
+
 @mcp.tool(
     description="Analyze frequently executed PostgreSQL queries and recommend optimal indexes.",
     annotations=ToolAnnotations(
@@ -676,7 +721,10 @@ async def main():
         type=str,
         choices=[mode.value for mode in AccessMode],
         default=AccessMode.RESTRICTED.value,
-        help="Set SQL access mode: restricted (read-only with protections, default) or unrestricted (full read/write access)",
+        help=(
+            "Set SQL access mode: restricted (read-only + SQL validation, default), "
+            "unrestricted (full read/write access), or readonly (read-only at DB level, no SQL validation)"
+        ),
     )
     parser.add_argument(
         "--transport",
@@ -718,6 +766,12 @@ async def main():
         "environment variable. Useful when defining many database configs so idle servers "
         "release their connections.",
     )
+    parser.add_argument(
+        "--allow-function-prefix",
+        action="append",
+        default=[],
+        help="Allow functions matching this lowercase prefix in restricted mode (repeatable)",
+    )
 
     args = parser.parse_args()
 
@@ -736,10 +790,15 @@ async def main():
                 DbConnPool.DEFAULT_MAX_IDLE,
             )
 
-    # Store the access mode in the global variable
-    global current_access_mode
-    current_access_mode = AccessMode(args.access_mode)
+    # Store the allowed function prefixes (used by get_sql_driver in RESTRICTED mode).
+    global current_allowed_function_prefixes
+    current_allowed_function_prefixes = tuple(p.lower() for p in args.allow_function_prefix)
 
+    # Set the access mode and register execute_sql with a matching description/annotations
+    # (configure_access_mode sets the current_access_mode global and adds the tool).
+    configure_access_mode(AccessMode(args.access_mode))
+
+    # Surface the security posture of the selected mode.
     if current_access_mode == AccessMode.UNRESTRICTED:
         logger.warning(
             "[SECURITY] UNRESTRICTED mode is active: the LLM can execute ANY SQL, "
@@ -754,26 +813,6 @@ async def main():
         logger.info(
             "Running in restricted (read-only) mode. "
             "Pass --access-mode=unrestricted for write access."
-        )
-
-    # Add the query tool with a description and annotations appropriate to the access mode
-    if current_access_mode == AccessMode.UNRESTRICTED:
-        mcp.add_tool(
-            execute_sql,
-            description="Execute any SQL query",
-            annotations=ToolAnnotations(
-                title="Execute SQL",
-                destructiveHint=True,
-            ),
-        )
-    else:
-        mcp.add_tool(
-            execute_sql,
-            description="Execute a read-only SQL query against the PostgreSQL database and return the results.",
-            annotations=ToolAnnotations(
-                title="Execute SQL (Read-Only)",
-                readOnlyHint=True,
-            ),
         )
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
