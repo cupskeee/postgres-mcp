@@ -56,6 +56,7 @@ class AccessMode(str, Enum):
 # Global variables
 db_connection = DbConnPool()
 current_access_mode = AccessMode.RESTRICTED
+current_allowed_function_prefixes: tuple[str, ...] = ()
 shutdown_in_progress = False
 
 
@@ -65,7 +66,11 @@ async def get_sql_driver() -> SqlDriver | SafeSqlDriver | ReadOnlySqlDriver:
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+        return SafeSqlDriver(
+            sql_driver=base_driver,
+            timeout=30,
+            allowed_function_prefixes=current_allowed_function_prefixes,
+        )
     elif current_access_mode == AccessMode.READONLY:
         logger.debug("Using ReadOnlySqlDriver (READONLY mode)")
         return ReadOnlySqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
@@ -758,6 +763,12 @@ async def main():
         "environment variable. Useful when defining many database configs so idle servers "
         "release their connections.",
     )
+    parser.add_argument(
+        "--allow-function-prefix",
+        action="append",
+        default=[],
+        help="Allow functions matching this lowercase prefix in restricted mode (repeatable)",
+    )
 
     args = parser.parse_args()
 
@@ -775,6 +786,10 @@ async def main():
                 max_idle_env,
                 DbConnPool.DEFAULT_MAX_IDLE,
             )
+
+    # Store the allowed function prefixes (used by get_sql_driver in RESTRICTED mode).
+    global current_allowed_function_prefixes
+    current_allowed_function_prefixes = tuple(p.lower() for p in args.allow_function_prefix)
 
     # Set the access mode and register execute_sql with a matching description/annotations
     # (configure_access_mode sets the current_access_mode global and adds the tool).
