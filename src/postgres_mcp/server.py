@@ -11,6 +11,7 @@ from typing import Literal
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
@@ -545,6 +546,40 @@ async def execute_sql(
         return format_error_response(str(e))
 
 
+def configure_access_mode(access_mode: AccessMode) -> None:
+    """Set the access mode and register execute_sql with a matching description and annotations.
+
+    Any earlier execute_sql registration is replaced, so this can be called more than once
+    (the server calls it at startup; tests call it to switch modes).
+    """
+    global current_access_mode
+    current_access_mode = access_mode
+
+    try:
+        mcp.remove_tool("execute_sql")
+    except ToolError:
+        pass  # not registered yet (first call at startup)
+
+    if access_mode == AccessMode.UNRESTRICTED:
+        mcp.add_tool(
+            execute_sql,
+            description="Execute any SQL query",
+            annotations=ToolAnnotations(
+                title="Execute SQL",
+                destructiveHint=True,
+            ),
+        )
+    else:
+        mcp.add_tool(
+            execute_sql,
+            description="Execute a read-only SQL query",
+            annotations=ToolAnnotations(
+                title="Execute SQL (Read-Only)",
+                readOnlyHint=True,
+            ),
+        )
+
+
 @mcp.tool(
     description="Analyze frequently executed PostgreSQL queries and recommend optimal indexes.",
     annotations=ToolAnnotations(
@@ -741,10 +776,11 @@ async def main():
                 DbConnPool.DEFAULT_MAX_IDLE,
             )
 
-    # Store the access mode in the global variable
-    global current_access_mode
-    current_access_mode = AccessMode(args.access_mode)
+    # Set the access mode and register execute_sql with a matching description/annotations
+    # (configure_access_mode sets the current_access_mode global and adds the tool).
+    configure_access_mode(AccessMode(args.access_mode))
 
+    # Surface the security posture of the selected mode.
     if current_access_mode == AccessMode.UNRESTRICTED:
         logger.warning(
             "[SECURITY] UNRESTRICTED mode is active: the LLM can execute ANY SQL, "
@@ -759,26 +795,6 @@ async def main():
         logger.info(
             "Running in restricted (read-only) mode. "
             "Pass --access-mode=unrestricted for write access."
-        )
-
-    # Add the query tool with a description and annotations appropriate to the access mode
-    if current_access_mode == AccessMode.UNRESTRICTED:
-        mcp.add_tool(
-            execute_sql,
-            description="Execute any SQL query",
-            annotations=ToolAnnotations(
-                title="Execute SQL",
-                destructiveHint=True,
-            ),
-        )
-    else:
-        mcp.add_tool(
-            execute_sql,
-            description="Execute a read-only SQL query against the PostgreSQL database and return the results.",
-            annotations=ToolAnnotations(
-                title="Execute SQL (Read-Only)",
-                readOnlyHint=True,
-            ),
         )
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
