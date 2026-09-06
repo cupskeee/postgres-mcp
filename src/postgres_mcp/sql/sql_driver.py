@@ -76,12 +76,32 @@ def obfuscate_password(text: str | None) -> str | None:
 class DbConnPool:
     """Database connection manager using psycopg's connection pool."""
 
-    def __init__(self, connection_url: str | None = None):
+    # Default seconds an unused connection stays open before being reaped.
+    DEFAULT_MAX_IDLE = 300
+
+    def __init__(self, connection_url: str | None = None, max_idle: int = DEFAULT_MAX_IDLE):
         self.connection_url = connection_url
+        self.max_idle = max_idle  # validated via the property setter
         self.pool: AsyncConnectionPool | None = None
         self._is_valid = False
         self._last_error = None
         self._connect_lock = asyncio.Lock()
+
+    @property
+    def max_idle(self) -> int:
+        """Seconds an unused connection stays open before being reaped."""
+        return self._max_idle
+
+    @max_idle.setter
+    def max_idle(self, value: int | None) -> None:
+        # psycopg_pool does not range-check max_idle, so a non-positive value would
+        # schedule a degenerate (zero/negative-interval) pool-shrink task. Reject it
+        # and fall back to the default instead.
+        if value is None or value <= 0:
+            logger.warning("Ignoring invalid max_idle=%r; using default of %s seconds", value, self.DEFAULT_MAX_IDLE)
+            self._max_idle = self.DEFAULT_MAX_IDLE
+        else:
+            self._max_idle = value
 
     async def pool_connect(self, connection_url: str | None = None) -> AsyncConnectionPool:
         """Initialize connection pool with retry logic."""
@@ -115,8 +135,13 @@ class DbConnPool:
                 # Configure connection pool with appropriate settings
                 self.pool = AsyncConnectionPool(
                     conninfo=url,
-                    min_size=1,
+                    # min_size=0 so an idle pool holds NO open connections; with lazy
+                    # pool_connect (first tool use) a configured-but-unused server keeps
+                    # zero Postgres connections. max_idle reaps connections after
+                    # inactivity so a database touched once and left alone is released.
+                    min_size=0,
                     max_size=5,
+                    max_idle=self.max_idle,
                     open=False,  # Don't connect immediately, let's do it explicitly
                     # Validate connections on checkout so ones broken while
                     # idle (server restart, idle timeout) are discarded and
