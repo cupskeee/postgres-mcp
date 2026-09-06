@@ -400,12 +400,14 @@ class DatabaseTuningAdvisor(IndexTuningBase):
             for column in candidate.columns:
                 table_columns.add((candidate.table, column))
 
-        # Create a list of table names for the query
-        tables_array = ",".join(f"'{table}'" for table, _ in table_columns)
-        columns_array = ",".join(f"'{col}'" for _, col in table_columns)
+        # Collect the distinct table and column names to bind as query parameters.
+        tables = sorted({table for table, _ in table_columns})
+        columns = sorted({col for _, col in table_columns})
 
-        # Query to get column types and their length limits from catalog
-        type_query = f"""
+        # Query to get column types and their length limits from catalog.
+        # Table/column names and max_text_length are passed as bound parameters
+        # (not interpolated) to prevent SQL injection via crafted identifiers.
+        type_query = """
             SELECT
                 c.table_name,
                 c.column_name,
@@ -416,7 +418,7 @@ class DatabaseTuningAdvisor(IndexTuningBase):
                     WHEN c.data_type = 'text' THEN true
                     WHEN (c.data_type = 'character varying' OR c.data_type = 'varchar' OR
                          c.data_type = 'character' OR c.data_type = 'char') AND
-                         (c.character_maximum_length IS NULL OR c.character_maximum_length > {max_text_length})
+                         (c.character_maximum_length IS NULL OR c.character_maximum_length > {})
                     THEN true
                     ELSE false
                 END as potential_long_text
@@ -424,11 +426,15 @@ class DatabaseTuningAdvisor(IndexTuningBase):
             LEFT JOIN pg_stats ON
                 pg_stats.tablename = c.table_name AND
                 pg_stats.attname = c.column_name
-            WHERE c.table_name IN ({tables_array})
-            AND c.column_name IN ({columns_array})
+            WHERE c.table_name = ANY({})
+            AND c.column_name = ANY({})
         """
 
-        result = await self.sql_driver.execute_query(type_query)  # type: ignore
+        result = await SafeSqlDriver.execute_param_query(
+            self.sql_driver,
+            type_query,
+            [max_text_length, tables, columns],
+        )
 
         logger.debug(f"Column types and length limits: {result}")
 

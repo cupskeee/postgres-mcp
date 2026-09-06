@@ -14,6 +14,7 @@ from pglast.ast import SelectStmt
 from pglast.ast import SortBy
 from pglast.ast import SortGroupClause
 from pglast.visitors import Visitor
+from psycopg.sql import Literal
 
 from .safe_sql import SafeSqlDriver
 from .sql_driver import SqlDriver
@@ -357,11 +358,17 @@ class SqlBindParams:
                         lower_bound = self._get_bound_values(stats, is_lower=True)
                         upper_bound = self._get_bound_values(stats, is_lower=False)
 
-                # Replace both parameters in the BETWEEN clause
+                # Replace both parameters in the BETWEEN clause.
+                # Escape the (possibly DB-derived) bound values as SQL literals so a
+                # crafted pg_stats value cannot inject SQL. A function replacement (with
+                # the literal captured as a default argument) is used so backslashes in
+                # the value are not interpreted as regex escapes.
                 param1_pattern = r"\$" + param1
                 param2_pattern = r"\$" + param2
-                modified_query = re.sub(param1_pattern, str(lower_bound), modified_query)
-                modified_query = re.sub(param2_pattern, str(upper_bound), modified_query)
+                lower_literal = Literal(lower_bound).as_string()
+                upper_literal = Literal(upper_bound).as_string()
+                modified_query = re.sub(param1_pattern, lambda _, s=lower_literal: s, modified_query)
+                modified_query = re.sub(param2_pattern, lambda _, s=upper_literal: s, modified_query)
 
             # Now handle remaining parameters normally
             # Recompute matches after BETWEEN replacements
@@ -449,7 +456,7 @@ class SqlBindParams:
                         # For string digits, convert and adjust
                         num_val = float(most_common)
                         adjustment = abs(num_val) * 0.05 if num_val != 0 else 1
-                        return str(int(num_val - adjustment)) if is_lower else str(int(num_val + adjustment))
+                        return int(num_val - adjustment) if is_lower else int(num_val + adjustment)
                     else:
                         # For non-numeric, just use most common
                         return most_common
@@ -484,9 +491,10 @@ class SqlBindParams:
         elif data_type in ["numeric", "decimal", "real", "double precision", "float"]:
             return 10.0 if is_lower else 20.0  # Very tight range
         elif "date" in data_type or "time" in data_type:
-            return "'2023-01-01'" if is_lower else "'2023-01-31'"  # Just one month
+            # Raw values; literalized (quoted) at the call site.
+            return "2023-01-01" if is_lower else "2023-01-31"  # Just one month
         elif data_type == "boolean":
-            return "true"  # Same value for both bounds for boolean
+            return True  # Same value for both bounds for boolean
         else:
             # Default string-like behavior - narrow range
             return "'m'" if is_lower else "'n'"  # Just two adjacent letters
@@ -648,11 +656,13 @@ class SqlBindParams:
             elif common_vals and is_equality:
                 # Use the most common value for equality
                 sample = common_vals[0]
-                return f"'{sample}'"
+                # Escape the DB-derived sample as a SQL literal to prevent injection.
+                return Literal(sample).as_string()
             elif common_vals:
                 # Use any sample value
                 sample = common_vals[0]
-                return f"'{sample}'"
+                # Escape the DB-derived sample as a SQL literal to prevent injection.
+                return Literal(sample).as_string()
             else:
                 # Default string
                 return "'sample_value'"
