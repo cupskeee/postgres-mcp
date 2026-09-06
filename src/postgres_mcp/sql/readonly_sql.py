@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
-from typing import Optional
 
 from typing_extensions import LiteralString
 
@@ -36,7 +35,7 @@ class ReadOnlySqlDriver(SqlDriver):
         query: LiteralString,
         params: list[Any] | None = None,
         force_readonly: bool = True,  # do not use value passed in
-    ) -> Optional[list[SqlDriver.RowResult]]:  # noqa: UP007
+    ) -> list[SqlDriver.RowResult] | None:  # noqa: UP007
         """Execute a query with forced read-only mode, without SQL validation."""
         # NOTE: Always force readonly=True in ReadOnlySqlDriver regardless of what was passed
         if self.timeout:

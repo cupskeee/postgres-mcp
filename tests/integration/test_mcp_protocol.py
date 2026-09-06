@@ -14,9 +14,9 @@ same task, and pytest-asyncio tears async fixtures down in a different task.
 
 import ast
 import logging
+from collections.abc import AsyncGenerator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
-from typing import AsyncIterator
 
 import pytest
 import pytest_asyncio

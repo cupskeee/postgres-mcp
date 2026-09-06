@@ -721,7 +721,10 @@ async def main():
         type=str,
         choices=[mode.value for mode in AccessMode],
         default=AccessMode.RESTRICTED.value,
-        help="Set SQL access mode: restricted (read-only + SQL validation, default), unrestricted (full read/write access), or readonly (read-only at DB level, no SQL validation)",
+        help=(
+            "Set SQL access mode: restricted (read-only + SQL validation, default), "
+            "unrestricted (full read/write access), or readonly (read-only at DB level, no SQL validation)"
+        ),
     )
     parser.add_argument(
         "--transport",
