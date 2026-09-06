@@ -212,6 +212,30 @@ The Postgres MCP Pro Docker image will automatically remap the hostname `localho
 }
 ```
 
+##### If you are using `uvx` with Windows WSL
+
+If you are using Windows WSL, you can use `uvx` with the following configuration to download and run Postgres MCP Pro:
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "wsl.exe",
+      "args": [
+        "bash",
+        "-c",
+        "/home/$WSL_USER/.local/bin/uvx --from git+https://github.com/crystaldba/postgres-mcp@main postgres-mcp postgresql://username:password@localhost:5432/dbname --access-mode=unrestricted"
+      ]
+    }
+  }
+}
+```
+
+Notes:
+- This command runs the latest version of Postgres MCP Pro from the `main` branch.
+- Replace `/home/$WSL_USER/.local/bin/uvx` with the path to your `uvx` command. If you do not know where `uvx` is installed, run `which uvx` in WSL.
+- If you do not have `uvx` installed, you may install it using `pip`.
+
 
 ##### Connection URI
 
@@ -230,6 +254,42 @@ Restricted mode is the default. To allow write operations, add `--access-mode=un
 > Deployments that relied on the implicit UNRESTRICTED default must pass
 > `--access-mode=unrestricted` explicitly after upgrading. Unrestricted startup
 > prints a warning explaining the prompt-injection risk.
+
+
+##### Idle Connection Timeout
+
+Postgres MCP Pro connects to the database **lazily** — no connection is opened when the server starts, only on the first tool call that needs the database. Once a connection has been idle for a while it is reaped, so a server you configure but don't use holds zero Postgres connections. This is helpful when you define many database configs and don't want every server holding an open connection from session start.
+
+The idle timeout defaults to **300 seconds** and is configurable with the `--max-idle` flag (in seconds), or the `DATABASE_MAX_IDLE` environment variable. The flag takes precedence over the environment variable, and invalid values (non-numeric, zero, or negative) fall back to the default.
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "uvx",
+      "args": [
+        "postgres-mcp",
+        "--access-mode=unrestricted",
+        "--max-idle=120"
+      ],
+      "env": {
+        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname"
+      }
+    }
+  }
+}
+```
+
+Equivalently, using the environment variable instead of the flag:
+
+```json
+      "env": {
+        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname",
+        "DATABASE_MAX_IDLE": "120"
+      }
+```
+
+A reaped connection is re-established transparently on the next tool call, restarting the idle timer. Lower values release connections faster (good for many-database setups); higher values keep connections warm to avoid reconnect latency on frequently-used databases.
 
 
 #### Other MCP Clients

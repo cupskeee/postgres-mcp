@@ -7,9 +7,7 @@ import signal
 import sys
 from enum import Enum
 from typing import Any
-from typing import List
 from typing import Literal
-from typing import Union
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
@@ -31,7 +29,6 @@ from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
-from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
 
 # Initialize FastMCP with default settings
@@ -41,7 +38,7 @@ mcp = FastMCP("postgres-mcp")
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
 
-ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
+ResponseType = list[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +56,7 @@ current_access_mode = AccessMode.RESTRICTED
 shutdown_in_progress = False
 
 
-async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
+async def get_sql_driver() -> SqlDriver | SafeSqlDriver:
     """Get the appropriate SQL driver based on the current access mode."""
     base_driver = SqlDriver(conn=db_connection)
 
@@ -82,7 +79,7 @@ def format_error_response(error: str) -> ResponseType:
 
 
 @mcp.tool(
-    description="List all schemas in the database",
+    description="List all schemas in the PostgreSQL database with their owners and types.",
     annotations=ToolAnnotations(
         title="List Schemas",
         readOnlyHint=True,
@@ -114,7 +111,10 @@ async def list_schemas() -> ResponseType:
 
 
 @mcp.tool(
-    description="List objects in a schema",
+    description=(
+        "List tables, views, materialized views, sequences, or extensions in a PostgreSQL schema. "
+        "Returns names and comments/descriptions for each object."
+    ),
     annotations=ToolAnnotations(
         title="List Objects",
         readOnlyHint=True,
@@ -122,7 +122,7 @@ async def list_schemas() -> ResponseType:
 )
 async def list_objects(
     schema_name: str = Field(description="Schema name"),
-    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    object_type: str = Field(description="Object type: 'table', 'view', 'materialized_view', 'sequence', or 'extension'", default="table"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     try:
@@ -133,15 +133,59 @@ async def list_objects(
             rows = await SafeSqlDriver.execute_param_query(
                 sql_driver,
                 """
-                SELECT table_schema, table_name, table_type
-                FROM information_schema.tables
-                WHERE table_schema = {} AND table_type = {}
-                ORDER BY table_name
+                SELECT
+                    t.table_schema,
+                    t.table_name,
+                    t.table_type,
+                    obj_description(
+                        (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass,
+                        'pg_class'
+                    ) AS comment
+                FROM information_schema.tables t
+                WHERE t.table_schema = {} AND t.table_type = {}
+                ORDER BY t.table_name
                 """,
                 [schema_name, table_type],
             )
             objects = (
-                [{"schema": row.cells["table_schema"], "name": row.cells["table_name"], "type": row.cells["table_type"]} for row in rows]
+                [
+                    {
+                        "schema": row.cells["table_schema"],
+                        "name": row.cells["table_name"],
+                        "type": row.cells["table_type"],
+                        "comment": row.cells["comment"],
+                    }
+                    for row in rows
+                ]
+                if rows
+                else []
+            )
+
+        elif object_type == "materialized_view":
+            rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT
+                    n.nspname AS schema_name,
+                    c.relname AS view_name,
+                    obj_description(c.oid, 'pg_class') AS comment
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind = 'm' AND n.nspname = {}
+                ORDER BY c.relname
+                """,
+                [schema_name],
+            )
+            objects = (
+                [
+                    {
+                        "schema": row.cells["schema_name"],
+                        "name": row.cells["view_name"],
+                        "type": "MATERIALIZED VIEW",
+                        "comment": row.cells["comment"],
+                    }
+                    for row in rows
+                ]
                 if rows
                 else []
             )
@@ -188,7 +232,11 @@ async def list_objects(
 
 
 @mcp.tool(
-    description="Show detailed information about a database object",
+    description=(
+        "Show columns (with types, nullability, defaults, and comments), constraints, indexes, and "
+        "the table/view comment for a PostgreSQL object. Use this BEFORE writing queries to "
+        "understand the schema."
+    ),
     annotations=ToolAnnotations(
         title="Get Object Details",
         readOnlyHint=True,
@@ -197,24 +245,72 @@ async def list_objects(
 async def get_object_details(
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
-    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    object_type: str = Field(description="Object type: 'table', 'view', 'materialized_view', 'sequence', or 'extension'", default="table"),
 ) -> ResponseType:
     """Get detailed information about a database object."""
     try:
         sql_driver = await get_sql_driver()
 
-        if object_type in ("table", "view"):
-            # Get columns
-            col_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns
-                WHERE table_schema = {} AND table_name = {}
-                ORDER BY ordinal_position
-                """,
-                [schema_name, object_name],
-            )
+        if object_type in ("table", "view", "materialized_view"):
+            # Get columns with comments (PR #160)
+            if object_type == "materialized_view":
+                # Materialized views are not in information_schema.columns — use pg_catalog
+                col_rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT
+                        a.attname AS column_name,
+                        pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                        CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+                        NULL AS column_default,
+                        col_description(c.oid, a.attnum) AS comment
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    JOIN pg_attribute a ON a.attrelid = c.oid
+                    WHERE n.nspname = {} AND c.relname = {}
+                      AND c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped
+                    ORDER BY a.attnum
+                    """,
+                    [schema_name, object_name],
+                )
+            else:
+                col_rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT
+                        c.column_name,
+                        c.data_type,
+                        c.is_nullable,
+                        c.column_default,
+                        col_description(
+                            (quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass,
+                            c.ordinal_position
+                        ) AS comment
+                    FROM information_schema.columns c
+                    WHERE c.table_schema = {} AND c.table_name = {}
+                    ORDER BY c.ordinal_position
+                    """,
+                    [schema_name, object_name],
+                )
+
+            # If no columns were found, verify the object actually exists so we return a
+            # clear error instead of an empty success (PR #143; extended to matviews).
+            if not col_rows:
+                exists_rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT tablename FROM pg_tables WHERE schemaname = {} AND tablename = {}
+                    UNION
+                    SELECT viewname FROM pg_views WHERE schemaname = {} AND viewname = {}
+                    UNION
+                    SELECT matviewname FROM pg_matviews WHERE schemaname = {} AND matviewname = {}
+                    """,
+                    [schema_name, object_name, schema_name, object_name, schema_name, object_name],
+                )
+
+                if not exists_rows:
+                    return format_error_response(f"{object_type.capitalize()} '{schema_name}.{object_name}' does not exist")
+
             columns = (
                 [
                     {
@@ -222,6 +318,7 @@ async def get_object_details(
                         "data_type": r.cells["data_type"],
                         "is_nullable": r.cells["is_nullable"],
                         "default": r.cells["column_default"],
+                        "comment": r.cells["comment"],
                     }
                     for r in col_rows
                 ]
@@ -270,8 +367,21 @@ async def get_object_details(
 
             indexes = [{"name": r.cells["indexname"], "definition": r.cells["indexdef"]} for r in idx_rows] if idx_rows else []
 
+            # Get table/view/materialized view comment
+            comment_rows = await SafeSqlDriver.execute_param_query(
+                sql_driver,
+                """
+                SELECT obj_description(c.oid, 'pg_class') AS comment
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = {} AND c.relname = {}
+                """,
+                [schema_name, object_name],
+            )
+            object_comment = comment_rows[0].cells["comment"] if comment_rows else None
+
             result = {
-                "basic": {"schema": schema_name, "name": object_name, "type": object_type},
+                "basic": {"schema": schema_name, "name": object_name, "type": object_type, "comment": object_comment},
                 "columns": columns,
                 "constraints": constraints_list,
                 "indexes": indexes,
@@ -327,7 +437,10 @@ async def get_object_details(
 
 
 @mcp.tool(
-    description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.",
+    description=(
+        "Explains the PostgreSQL execution plan for a SQL query, showing how the database will "
+        "execute it and provides detailed cost estimates."
+    ),
     annotations=ToolAnnotations(
         title="Explain Query",
         readOnlyHint=True,
@@ -428,7 +541,7 @@ async def execute_sql(
 
 
 @mcp.tool(
-    description="Analyze frequently executed queries in the database and recommend optimal indexes",
+    description="Analyze frequently executed PostgreSQL queries and recommend optimal indexes.",
     annotations=ToolAnnotations(
         title="Analyze Workload Indexes",
         readOnlyHint=True,
@@ -455,7 +568,7 @@ async def analyze_workload_indexes(
 
 
 @mcp.tool(
-    description="Analyze a list of (up to 10) SQL queries and recommend optimal indexes",
+    description="Analyze a list of (up to 10) PostgreSQL queries and recommend optimal indexes.",
     annotations=ToolAnnotations(
         title="Analyze Query Indexes",
         readOnlyHint=True,
@@ -488,7 +601,7 @@ async def analyze_query_indexes(
 
 
 @mcp.tool(
-    description="Analyzes database health. Here are the available health checks:\n"
+    description="Analyzes PostgreSQL database health. Here are the available health checks:\n"
     "- index - checks for invalid, duplicate, and bloated indexes\n"
     "- connection - checks the number of connection and their utilization\n"
     "- vacuum - checks vacuum health for transaction id wraparound\n"
@@ -596,8 +709,32 @@ async def main():
         default=8000,
         help="Port for streamable HTTP server (default: 8000)",
     )
+    parser.add_argument(
+        "--max-idle",
+        type=int,
+        default=None,
+        help="Seconds an unused database connection stays open before it is reaped "
+        f"(default: {DbConnPool.DEFAULT_MAX_IDLE}). Can also be set via the DATABASE_MAX_IDLE "
+        "environment variable. Useful when defining many database configs so idle servers "
+        "release their connections.",
+    )
 
     args = parser.parse_args()
+
+    # Configure the idle-connection timeout (CLI flag takes precedence over env var).
+    # Invalid values are rejected by DbConnPool.max_idle, which falls back to the default.
+    max_idle_env = os.environ.get("DATABASE_MAX_IDLE")
+    if args.max_idle is not None:
+        db_connection.max_idle = args.max_idle
+    elif max_idle_env is not None:
+        try:
+            db_connection.max_idle = int(max_idle_env)
+        except ValueError:
+            logger.warning(
+                "Ignoring non-numeric DATABASE_MAX_IDLE=%r; using default of %s seconds",
+                max_idle_env,
+                DbConnPool.DEFAULT_MAX_IDLE,
+            )
 
     # Store the access mode in the global variable
     global current_access_mode
@@ -632,7 +769,7 @@ async def main():
     else:
         mcp.add_tool(
             execute_sql,
-            description="Execute a read-only SQL query",
+            description="Execute a read-only SQL query against the PostgreSQL database and return the results.",
             annotations=ToolAnnotations(
                 title="Execute SQL (Read-Only)",
                 readOnlyHint=True,
@@ -649,17 +786,13 @@ async def main():
             "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
         )
 
-    # Initialize database connection pool
-    try:
-        await db_connection.pool_connect(database_url)
-        logger.info("Successfully connected to database and initialized connection pool")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database: {obfuscate_password(str(e))}",
-        )
-        logger.warning(
-            "The MCP server will start but database operations will fail until a valid connection is established.",
-        )
+    # Store the database URL but do NOT connect yet. The connection pool is
+    # established lazily on the first tool call that needs it (see
+    # SqlDriver.execute_query -> DbConnPool.pool_connect). This lets you define
+    # many database MCP configs without each server holding an open Postgres
+    # connection from session start.
+    db_connection.connection_url = database_url
+    logger.info("Database URL configured; connection will be established on first use (lazy)")
 
     # Set up proper shutdown handling
     try:

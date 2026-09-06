@@ -1,20 +1,62 @@
 """SQL driver adapter for PostgreSQL connections."""
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Optional
 from urllib.parse import urlparse
 from urllib.parse import urlunparse
 
+import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString
 
 logger = logging.getLogger(__name__)
+
+_HYPOPG_SCHEMA_QUERY = """
+SELECT n.nspname
+FROM pg_catalog.pg_extension e
+JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'hypopg'
+"""
+
+
+async def reset_pooled_connection(conn: Any) -> None:
+    """Reset session state before a pooled connection is reused.
+
+    ``DISCARD ALL`` cannot run inside a transaction, and psycopg defaults to
+    autocommit=False, so this callback temporarily enables autocommit. Cleanup
+    errors propagate so psycopg_pool discards the connection.
+    """
+    previous_autocommit = conn.autocommit
+    await conn.set_autocommit(True)
+    try:
+        await conn.execute("DISCARD ALL")
+        result = await conn.execute(_HYPOPG_SCHEMA_QUERY)
+        row = await result.fetchone()
+        if row:
+            schema = row["nspname"] if isinstance(row, dict) else row[0]
+            await conn.execute(sql.SQL("SELECT {schema}.hypopg_reset()").format(schema=sql.Identifier(schema)))
+    finally:
+        await conn.set_autocommit(previous_autocommit)
+
+
+def _invalidates_pool(e: BaseException) -> bool:
+    """Whether an error means the connection pool itself is unusable.
+
+    Query-level failures (bad SQL, constraint violations, ...) and statement
+    timeouts leave the underlying connections healthy, so the pool must
+    survive them. Only connection-level errors (server gone away, broken
+    socket, pool timeout/closed — all OperationalError or InterfaceError)
+    warrant rebuilding the pool.
+    """
+    if isinstance(e, psycopg.errors.QueryCanceled):
+        # Statement timeout / cancellation: the connection is fine.
+        return False
+    return isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError))
 
 
 def obfuscate_password(text: str | None) -> str | None:
@@ -62,56 +104,102 @@ def obfuscate_password(text: str | None) -> str | None:
 class DbConnPool:
     """Database connection manager using psycopg's connection pool."""
 
-    def __init__(self, connection_url: Optional[str] = None):
+    # Default seconds an unused connection stays open before being reaped.
+    DEFAULT_MAX_IDLE = 300
+
+    def __init__(self, connection_url: str | None = None, max_idle: int = DEFAULT_MAX_IDLE):
         self.connection_url = connection_url
+        self.max_idle = max_idle  # validated via the property setter
         self.pool: AsyncConnectionPool | None = None
         self._is_valid = False
         self._last_error = None
+        self._connect_lock = asyncio.Lock()
 
-    async def pool_connect(self, connection_url: Optional[str] = None) -> AsyncConnectionPool:
+    @property
+    def max_idle(self) -> int:
+        """Seconds an unused connection stays open before being reaped."""
+        return self._max_idle
+
+    @max_idle.setter
+    def max_idle(self, value: int | None) -> None:
+        # psycopg_pool does not range-check max_idle, so a non-positive value would
+        # schedule a degenerate (zero/negative-interval) pool-shrink task. Reject it
+        # and fall back to the default instead.
+        if value is None or value <= 0:
+            logger.warning("Ignoring invalid max_idle=%r; using default of %s seconds", value, self.DEFAULT_MAX_IDLE)
+            self._max_idle = self.DEFAULT_MAX_IDLE
+        else:
+            self._max_idle = value
+
+    async def pool_connect(self, connection_url: str | None = None) -> AsyncConnectionPool:
         """Initialize connection pool with retry logic."""
         # If we already have a valid pool, return it
         if self.pool and self._is_valid:
             return self.pool
 
-        url = connection_url or self.connection_url
-        self.connection_url = url
-        if not url:
-            self._is_valid = False
-            self._last_error = "Database connection URL not provided"
-            raise ValueError(self._last_error)
+        # Serialize pool (re)creation. Without the lock, concurrent callers
+        # that each observed an invalid pool would each build an
+        # AsyncConnectionPool and assign it to self.pool; every overwritten
+        # pool is left open forever — leaking its connections and worker
+        # tasks — and callers still holding a pool that a later winner
+        # closed fail with "the pool 'pool-N' is closed".
+        async with self._connect_lock:
+            # Re-check under the lock: another task may have already rebuilt
+            # the pool while we were waiting.
+            if self.pool and self._is_valid:
+                return self.pool
 
-        # Close any existing pool before creating a new one
-        await self.close()
+            url = connection_url or self.connection_url
+            self.connection_url = url
+            if not url:
+                self._is_valid = False
+                self._last_error = "Database connection URL not provided"
+                raise ValueError(self._last_error)
 
-        try:
-            # Configure connection pool with appropriate settings
-            self.pool = AsyncConnectionPool(
-                conninfo=url,
-                min_size=1,
-                max_size=5,
-                open=False,  # Don't connect immediately, let's do it explicitly
-            )
-
-            # Open the pool explicitly
-            await self.pool.open()
-
-            # Test the connection pool by executing a simple query
-            async with self.pool.connection() as conn:
-                async with conn.cursor() as cursor:
-                    await cursor.execute("SELECT 1")
-
-            self._is_valid = True
-            self._last_error = None
-            return self.pool
-        except Exception as e:
-            self._is_valid = False
-            self._last_error = str(e)
-
-            # Clean up failed pool
+            # Close any existing pool before creating a new one
             await self.close()
 
-            raise ValueError(f"Connection attempt failed: {obfuscate_password(str(e))}") from e
+            try:
+                # Configure connection pool with appropriate settings
+                self.pool = AsyncConnectionPool(
+                    conninfo=url,
+                    # min_size=0 so an idle pool holds NO open connections; with lazy
+                    # pool_connect (first tool use) a configured-but-unused server keeps
+                    # zero Postgres connections. max_idle reaps connections after
+                    # inactivity so a database touched once and left alone is released.
+                    min_size=0,
+                    max_size=5,
+                    max_idle=self.max_idle,
+                    open=False,  # Don't connect immediately, let's do it explicitly
+                    # Validate connections on checkout so ones broken while
+                    # idle (server restart, idle timeout) are discarded and
+                    # replaced instead of surfacing as query errors.
+                    check=AsyncConnectionPool.check_connection,
+                    # Reset each connection on return (DISCARD ALL + hypopg_reset)
+                    # so leaked session GUCs / hypothetical indexes don't bleed to
+                    # the next request reusing the backend (PR #213).
+                    reset=reset_pooled_connection,
+                )
+
+                # Open the pool explicitly
+                await self.pool.open()
+
+                # Test the connection pool by executing a simple query
+                async with self.pool.connection() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute("SELECT 1")
+
+                self._is_valid = True
+                self._last_error = None
+                return self.pool
+            except Exception as e:
+                self._is_valid = False
+                self._last_error = str(e)
+
+                # Clean up failed pool
+                await self.close()
+
+                raise ValueError(f"Connection attempt failed: {obfuscate_password(str(e))}") from e
 
     async def close(self) -> None:
         """Close the connection pool."""
@@ -131,7 +219,7 @@ class DbConnPool:
         return self._is_valid
 
     @property
-    def last_error(self) -> Optional[str]:
+    def last_error(self) -> str | None:
         """Get the last error message."""
         return self._last_error
 
@@ -143,7 +231,7 @@ class SqlDriver:
     class RowResult:
         """Simple class to match the Griptape RowResult interface."""
 
-        cells: Dict[str, Any]
+        cells: dict[str, Any]
 
     def __init__(
         self,
@@ -184,7 +272,7 @@ class SqlDriver:
         query: LiteralString,
         params: list[Any] | None = None,
         force_readonly: bool = False,
-    ) -> Optional[List[RowResult]]:
+    ) -> list[RowResult] | None:
         """
         Execute a query and return results.
 
@@ -212,16 +300,21 @@ class SqlDriver:
                 # Direct connection approach
                 return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly)
         except Exception as e:
-            # Mark pool as invalid if there was a connection issue
+            # Mark pool as invalid only on connection-level errors. Doing it
+            # for every exception meant any bad SQL statement poisoned the
+            # shared pool, and the next call tore it down and built a new
+            # one — the pool churn and "the pool 'pool-N' is closed" errors
+            # of issue #98.
             if self.conn and self.is_pool:
-                self.conn._is_valid = False  # type: ignore
-                self.conn._last_error = str(e)  # type: ignore
+                if _invalidates_pool(e):
+                    self.conn._is_valid = False  # type: ignore
+                    self.conn._last_error = str(e)  # type: ignore
             elif self.conn and not self.is_pool:
                 self.conn = None
 
             raise e
 
-    async def _execute_with_connection(self, connection, query, params, force_readonly) -> Optional[List[RowResult]]:
+    async def _execute_with_connection(self, connection, query, params, force_readonly) -> list[RowResult] | None:
         """Execute query with the given connection."""
         transaction_started = False
         try:
