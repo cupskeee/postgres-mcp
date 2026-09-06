@@ -26,6 +26,7 @@ from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
 from .sql import DbConnPool
+from .sql import ReadOnlySqlDriver
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
@@ -48,6 +49,7 @@ class AccessMode(str, Enum):
 
     RESTRICTED = "restricted"  # Read-only with safety features (default)
     UNRESTRICTED = "unrestricted"  # Unrestricted access
+    READONLY = "readonly"  # Read-only at DB level, no SQL validation
 
 
 # Global variables
@@ -56,13 +58,16 @@ current_access_mode = AccessMode.RESTRICTED
 shutdown_in_progress = False
 
 
-async def get_sql_driver() -> SqlDriver | SafeSqlDriver:
+async def get_sql_driver() -> SqlDriver | SafeSqlDriver | ReadOnlySqlDriver:
     """Get the appropriate SQL driver based on the current access mode."""
     base_driver = SqlDriver(conn=db_connection)
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
         return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+    elif current_access_mode == AccessMode.READONLY:
+        logger.debug("Using ReadOnlySqlDriver (READONLY mode)")
+        return ReadOnlySqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
@@ -676,7 +681,7 @@ async def main():
         type=str,
         choices=[mode.value for mode in AccessMode],
         default=AccessMode.RESTRICTED.value,
-        help="Set SQL access mode: restricted (read-only with protections, default) or unrestricted (full read/write access)",
+        help="Set SQL access mode: restricted (read-only + SQL validation, default), unrestricted (full read/write access), or readonly (read-only at DB level, no SQL validation)",
     )
     parser.add_argument(
         "--transport",
