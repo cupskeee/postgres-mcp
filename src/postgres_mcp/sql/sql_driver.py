@@ -9,11 +9,39 @@ from urllib.parse import urlparse
 from urllib.parse import urlunparse
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString
 
 logger = logging.getLogger(__name__)
+
+_HYPOPG_SCHEMA_QUERY = """
+SELECT n.nspname
+FROM pg_catalog.pg_extension e
+JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'hypopg'
+"""
+
+
+async def reset_pooled_connection(conn: Any) -> None:
+    """Reset session state before a pooled connection is reused.
+
+    ``DISCARD ALL`` cannot run inside a transaction, and psycopg defaults to
+    autocommit=False, so this callback temporarily enables autocommit. Cleanup
+    errors propagate so psycopg_pool discards the connection.
+    """
+    previous_autocommit = conn.autocommit
+    await conn.set_autocommit(True)
+    try:
+        await conn.execute("DISCARD ALL")
+        result = await conn.execute(_HYPOPG_SCHEMA_QUERY)
+        row = await result.fetchone()
+        if row:
+            schema = row["nspname"] if isinstance(row, dict) else row[0]
+            await conn.execute(sql.SQL("SELECT {schema}.hypopg_reset()").format(schema=sql.Identifier(schema)))
+    finally:
+        await conn.set_autocommit(previous_autocommit)
 
 
 def _invalidates_pool(e: BaseException) -> bool:
@@ -147,6 +175,10 @@ class DbConnPool:
                     # idle (server restart, idle timeout) are discarded and
                     # replaced instead of surfacing as query errors.
                     check=AsyncConnectionPool.check_connection,
+                    # Reset each connection on return (DISCARD ALL + hypopg_reset)
+                    # so leaked session GUCs / hypothetical indexes don't bleed to
+                    # the next request reusing the backend (PR #213).
+                    reset=reset_pooled_connection,
                 )
 
                 # Open the pool explicitly
