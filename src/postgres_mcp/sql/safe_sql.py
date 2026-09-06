@@ -219,6 +219,11 @@ class SafeSqlDriver(SqlDriver):
         "string_to_array",
         "trim_array",
         "unnest",
+        # Set-returning functions commonly used in FROM clauses (read-only, no side effects).
+        # Explicitly allowlisted so the recursive FROM-clause validation above does not
+        # reject legitimate queries once nested RangeFunction calls are checked.
+        "generate_series",
+        "generate_subscripts",
         "any",
         # String functions
         "ascii",
@@ -929,29 +934,21 @@ class SafeSqlDriver(SqlDriver):
                 # Skip attributes that don't exist (this is normal in pglast)
                 continue
 
-            # Handle lists of nodes
-            if isinstance(attr, list):
-                for item in attr:
-                    if isinstance(item, Node):
-                        self._validate_node(item)
-                    elif isinstance(item, tuple):
-                        for inner in item:
-                            if isinstance(inner, Node):
-                                self._validate_node(inner)
+            # Validate every AST Node reachable through this attribute, descending
+            # into arbitrarily nested lists/tuples. pglast stores some slots (e.g.
+            # RangeFunction.functions) as tuples of (FuncCall, coldeflist) tuples,
+            # so a shallow walk that only inspects top-level Node items would let a
+            # FROM-clause function call skip the ALLOWED_FUNCTIONS check
+            # (the RangeFunction allowlist bypass).
+            self._validate_tree(attr)
 
-            # Handle tuples of nodes
-            elif isinstance(attr, tuple):
-                for item in attr:
-                    if isinstance(item, Node):
-                        self._validate_node(item)
-                    elif isinstance(item, tuple):
-                        for inner in item:
-                            if isinstance(inner, Node):
-                                self._validate_node(inner)
-
-            # Handle single nodes
-            elif isinstance(attr, Node):
-                self._validate_node(attr)
+    def _validate_tree(self, attr: Any) -> None:
+        """Recursively validate every AST Node reachable through nested lists/tuples."""
+        if isinstance(attr, Node):
+            self._validate_node(attr)
+        elif isinstance(attr, (list, tuple)):
+            for item in attr:
+                self._validate_tree(item)
 
     def _validate(self, query: str) -> None:
         """Validate query is safe to execute"""

@@ -780,3 +780,32 @@ async def test_from_clause_allowed_function_permitted(safe_driver, mock_sql_driv
     query = "SELECT * FROM unnest(ARRAY[1,2,3]) AS t"
     await safe_driver.execute_query(query)
     mock_sql_driver.execute_query.assert_awaited_once_with("/* crystaldba */ " + query, params=None, force_readonly=True)
+
+
+@pytest.mark.asyncio
+async def test_from_clause_generate_series_permitted(safe_driver, mock_sql_driver):
+    """generate_series/generate_subscripts are read-only set-returning functions and must
+    stay allowed in the FROM clause after the RangeFunction validation fix (regression guard
+    for the allowlist gap that would otherwise reject `SELECT * FROM generate_series(...)`)."""
+    for query in [
+        "SELECT * FROM generate_series(1, 10) AS g(n)",
+        "SELECT * FROM generate_subscripts(ARRAY[1, 2, 3], 1)",
+    ]:
+        mock_sql_driver.execute_query.reset_mock()
+        await safe_driver.execute_query(query)
+        mock_sql_driver.execute_query.assert_awaited_once_with("/* crystaldba */ " + query, params=None, force_readonly=True)
+
+
+@pytest.mark.asyncio
+async def test_from_clause_dangerous_function_blocked_when_nested(safe_driver):
+    """Non-allowlisted functions must be blocked in the FROM clause even when nested inside
+    ROWS FROM tuples, a CTE, or a subquery — verifying the fully-recursive AST walk, not just
+    the top-level RangeFunction case."""
+    queries = [
+        "SELECT * FROM ROWS FROM (dblink('host=127.0.0.1', 'DELETE FROM users') AS (a text))",
+        "WITH x AS (SELECT * FROM pg_read_file('/etc/passwd')) SELECT * FROM x",
+        "SELECT * FROM (SELECT * FROM pg_ls_dir('/')) s",
+    ]
+    for query in queries:
+        with pytest.raises(ValueError, match="Error validating query"):
+            await safe_driver.execute_query(query)
