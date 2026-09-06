@@ -111,7 +111,10 @@ async def list_schemas() -> ResponseType:
 
 
 @mcp.tool(
-    description="List tables, views, materialized views, sequences, or extensions in a PostgreSQL schema. Returns names and comments/descriptions for each object.",
+    description=(
+        "List tables, views, materialized views, sequences, or extensions in a PostgreSQL schema. "
+        "Returns names and comments/descriptions for each object."
+    ),
     annotations=ToolAnnotations(
         title="List Objects",
         readOnlyHint=True,
@@ -229,7 +232,11 @@ async def list_objects(
 
 
 @mcp.tool(
-    description="Show columns (with types, nullability, defaults, and comments), constraints, indexes, and the table/view comment for a PostgreSQL object. Use this BEFORE writing queries to understand the schema.",
+    description=(
+        "Show columns (with types, nullability, defaults, and comments), constraints, indexes, and "
+        "the table/view comment for a PostgreSQL object. Use this BEFORE writing queries to "
+        "understand the schema."
+    ),
     annotations=ToolAnnotations(
         title="Get Object Details",
         readOnlyHint=True,
@@ -430,7 +437,10 @@ async def get_object_details(
 
 
 @mcp.tool(
-    description="Explains the PostgreSQL execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.",
+    description=(
+        "Explains the PostgreSQL execution plan for a SQL query, showing how the database will "
+        "execute it and provides detailed cost estimates."
+    ),
     annotations=ToolAnnotations(
         title="Explain Query",
         readOnlyHint=True,
